@@ -27,6 +27,9 @@ async function main(){
   console.log('Validated counts:',b.records.length,b.scheduleRules.length,b.payrollSettings.length);
   if(!flag) return console.log('Dry run: no database connection or writes');
   assert(process.env.RESTORE_DATABASE_URL,'Set RESTORE_DATABASE_URL to NEW target database');
+  assert(process.env.DATABASE_URL,'Set DATABASE_URL to current production database for safety comparison');
+  const identity = value => { const u = new URL(value); assert(['postgres:', 'postgresql:'].includes(u.protocol), 'Invalid database URL'); assert(u.hostname && u.pathname.length > 1, 'Invalid database target'); return JSON.stringify([u.hostname.toLowerCase(), u.port || '5432', decodeURIComponent(u.pathname.slice(1))]); };
+  assert(identity(process.env.RESTORE_DATABASE_URL) !== identity(process.env.DATABASE_URL), 'Restore target matches production database');
   const {Pool} = require('pg');
   const pool=new Pool({connectionString:process.env.RESTORE_DATABASE_URL});
   try { const c=await pool.connect(); try {

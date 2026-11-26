@@ -1,6 +1,6 @@
 const units=['개','마리','kg','g','L','ml','병','팩','봉지','박스','세트','판','기타'];
 const opts=(a,v)=>a.map(x=>`<option ${x===v?'selected':''}>${esc(x)}</option>`).join('');
-const inp=(k,v='',t='text')=>`<input name="${k}" type="${t}" ${t==='number'?'min="0" step="any"':''} value="${esc(v)}">`;
+const inp=(k,v='',t='text')=>`<input name="${k}" type="${t}" ${t==='number'?`min="0" step="any" inputmode="${k==='qty'?'decimal':'numeric'}"`:''} value="${esc(v)}">`;
 const sel=(k,a,v)=>`<select name="${k}">${opts(a,v)}</select>`;
 const lab=(l,h)=>`<label>${l}</label>${h}`;
 const sum=(a,k)=>a.reduce((s,x)=>s+(+x[k]||0),0);
