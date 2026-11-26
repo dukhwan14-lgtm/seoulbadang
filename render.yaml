@@ -2,7 +2,7 @@ services:
   - type: web
     name: seoulbadang
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm install
     startCommand: npm start
     envVars:
@@ -20,4 +20,4 @@ services:
         sync: false
 databases:
   - name: seoulbadang-db
-    plan: basic-256mb
+    plan: free
