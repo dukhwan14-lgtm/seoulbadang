@@ -5,6 +5,7 @@ const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
 const { shiftConflict, weeklyConflict, weekStart } = require('./payroll-guard');
 
+const staff = require('./staff');
 const app = express();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const { STAFF_PIN, ADMIN_PIN, SESSION_SECRET } = process.env;
@@ -24,34 +25,42 @@ app.use('/api', (req, res, next) => {
 const sign = s => crypto.createHmac('sha256', SESSION_SECRET).update(s).digest('hex');
 const equal = (a, b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 
-app.post('/api/login', rateLimit({ windowMs: 900000, limit: 10 }), (req, res) => {
+app.post('/api/login', rateLimit({ windowMs: 900000, limit: 10 }), async (req, res) => {
   const p = req.body.pin;
-  const role = equal(p, ADMIN_PIN) ? '관리자' : equal(p, STAFF_PIN) ? '직원' : null;
+  let account;
+  if (typeof req.body.username === 'string' && staff.validPassword(req.body.password)) {
+    account = (await pool.query('SELECT * FROM staff_accounts WHERE username=$1 AND active', [req.body.username])).rows[0];
+    if (!account || !await staff.verify(req.body.password,account.password_hash)) return res.status(401).json({error:'로그인 정보를 확인하세요'});
+  }
+  const role = account ? '직원' : equal(p, ADMIN_PIN) ? '관리자' : equal(p, STAFF_PIN) ? '직원' : null;
   if (!role) return res.status(401).json({ error: 'PIN을 확인하세요' });
-  const s = Buffer.from(JSON.stringify({ role, exp: Date.now() + 43200000 })).toString('base64url');
+  const s = Buffer.from(JSON.stringify({ role, ...(account ? {username:account.username,revision:account.revision} : {}), exp: Date.now() + 43200000 })).toString('base64url');
   res.cookie('session', s + '.' + sign(s), { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', maxAge: 43200000 });
-  res.json({ role });
+  res.json({ role, name:account?.name, personal:!!account });
 });
 
-app.use('/api', (req, res, next) => {
+app.use('/api', async (req, res, next) => {
   try {
     const [s, h] = (req.headers.cookie || '').match(/(?:^|; )session=([^;]+)/)[1].split('.');
     if (!equal(h, sign(s))) throw Error();
     const v = JSON.parse(Buffer.from(s, 'base64url'));
     if (v.exp < Date.now()) throw Error();
     req.role = v.role;
+    if(v.username){req.staff=(await pool.query('SELECT username,name,store FROM staff_accounts WHERE username=$1 AND active AND revision=$2',[v.username,v.revision])).rows[0];if(!req.staff)throw Error();}
     next();
   } catch {
     res.status(401).json({ error: '다시 로그인하세요' });
   }
 });
 
-app.get('/api/session', (req, res) => res.json({ role: req.role }));
+app.get('/api/session', (req, res) => res.json({ role: req.role, name:req.staff?.name, personal:!!req.staff }));
 app.post('/api/logout', (req, res) => { res.clearCookie('session'); res.json({ ok: true }); });
 
 const stores = ['뚝섬점', '혜화점'];
 const tabs = ['order', 'resv', 'stock', 'shift', 'closing', 'schedule', 'payroll'];
 const adminOnly = (req, res, next) => req.role === '관리자' ? next() : res.sendStatus(403);
+
+staff.routes(app,pool,adminOnly);
 
 function scope(req, res, next) {
   const { store, day, tab } = req.query;
@@ -236,8 +245,10 @@ app.get('/api/backup-full', adminOnly, async (req, res) => {
     const records = (await c.query('SELECT id,store,day::text,tab,data,version FROM records ORDER BY id')).rows;
     const scheduleRules = (await c.query('SELECT name,data FROM schedule_rules ORDER BY name')).rows;
     const payrollSettings = (await c.query('SELECT year,min_wage FROM payroll_settings ORDER BY year')).rows;
+    const staffAccounts=(await c.query('SELECT username,name,store,active FROM staff_accounts ORDER BY username')).rows;
+    const leaveRequests=(await c.query('SELECT id,username,day::text,reason,status,created_at,decided_at FROM leave_requests ORDER BY id')).rows;
     await c.query('COMMIT');
-    res.json({ format: 'seoulbadang-full-v1', exportedAt: new Date().toISOString(), records, scheduleRules, payrollSettings });
+    res.json({ staffAccounts,leaveRequests,format: 'seoulbadang-full-v1', exportedAt: new Date().toISOString(), records, scheduleRules, payrollSettings });
   } catch (e) { await c.query('ROLLBACK'); throw e; }
   finally { c.release(); }
 });
@@ -308,5 +319,6 @@ app.use((err, req, res, next) => {
     CREATE INDEX IF NOT EXISTS records_scope ON records(store,day,tab);
     INSERT INTO payroll_settings(year,min_wage) SELECT year,min_wage FROM (VALUES ('2025',10030),('2026',10320)) AS v(year,min_wage) WHERE NOT EXISTS (SELECT 1 FROM payroll_settings);
   `);
+  await pool.query(staff.schema);
   app.listen(process.env.PORT || 3000);
 })().catch(e => { console.error(e.message); process.exit(1); });
