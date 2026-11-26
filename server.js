@@ -286,7 +286,7 @@ app.use((err, req, res, next) => {
     CREATE TABLE IF NOT EXISTS schedule_rules(name TEXT PRIMARY KEY,data JSONB NOT NULL);
     CREATE TABLE IF NOT EXISTS payroll_settings(year TEXT PRIMARY KEY,min_wage INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS records_scope ON records(store,day,tab);
-    INSERT INTO payroll_settings(year,min_wage) VALUES ('2025',10030),('2026',10320) ON CONFLICT(year) DO NOTHING;
+    INSERT INTO payroll_settings(year,min_wage) SELECT year,min_wage FROM (VALUES ('2025',10030),('2026',10320)) AS v(year,min_wage) WHERE NOT EXISTS (SELECT 1 FROM payroll_settings);
   `);
   app.listen(process.env.PORT || 3000);
 })().catch(e => { console.error(e.message); process.exit(1); });
