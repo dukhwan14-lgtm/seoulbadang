@@ -159,8 +159,8 @@ async function validate(tab, r) {
 }
 
 // 같은 매장·직원의 동일 근무와 같은 주(월~일) 주휴수당 중복 차단
-async function assertPayrollUnique(store, day, data, excludeId) {
-  const near = await pool.query(
+async function assertPayrollUnique(store, day, data, excludeId, client) {
+  const near = await client.query(
     "SELECT id,store,day::text,data FROM records WHERE tab='payroll' AND store=$1 AND data->>'name'=$2 AND day BETWEEN $3::date - 1 AND $3::date + 1",
     [store, data.name, day]
   );
@@ -168,7 +168,7 @@ async function assertPayrollUnique(store, day, data, excludeId) {
   if (dup) throw Error(`동일 근무가 이미 등록되어 있습니다 (${dup.day} ${dup.start}~${dup.end} ${dup.name})`);
   if (+data.weekly > 0 || +data.weeklyMinutes > 0) {
     const ws = weekStart(day);
-    const week = await pool.query(
+    const week = await client.query(
       "SELECT id,store,day::text,data FROM records WHERE tab='payroll' AND data->>'name'=$1 AND day >= $2::date AND day < $2::date + 7",
       [data.name, ws]
     );
@@ -190,26 +190,32 @@ app.get('/api/records', scope, async (req, res) => {
   res.json(q.rows.map(x => ({ ...x.data, id: x.id, version: x.version })));
 });
 
-app.post('/api/records', scope, async (req, res) => {
+// Serialize payroll validation and writes across concurrent requests.
+async function writeRecord(req, res, update) {
   let data;
   try { data = await validate(req.scope[2], { ...req.body, day: req.scope[1] }); } catch (e) { return res.status(400).json({ error: e.message }); }
-  if (req.scope[2] === 'payroll') {
-    try { await assertPayrollUnique(req.scope[0], req.scope[1], data, null); } catch (e) { return res.status(409).json({ error: e.message }); }
-  }
-  await pool.query('INSERT INTO records(store,day,tab,data) VALUES($1,$2,$3,$4)', [...req.scope, data]);
-  res.json({ ok: true });
-});
-
-app.put('/api/records/:id', scope, async (req, res) => {
-  let data;
-  try { data = await validate(req.scope[2], { ...req.body, day: req.scope[1] }); } catch (e) { return res.status(400).json({ error: e.message }); }
-  if (req.scope[2] === 'payroll') {
-    try { await assertPayrollUnique(req.scope[0], req.scope[1], data, req.params.id); } catch (e) { return res.status(409).json({ error: e.message }); }
-  }
-  const q = await pool.query('UPDATE records SET data=$5,version=version+1 WHERE store=$1 AND day=$2 AND tab=$3 AND id=$4 AND version=$6', [...req.scope, req.params.id, data, req.body.version]);
-  if (!q.rowCount) return res.status(409).json({ error: '다른 직원이 변경했습니다. 새로고침하세요' });
-  res.json({ ok: true });
-});
+  const payroll = req.scope[2] === 'payroll';
+  const c = payroll ? await pool.connect() : pool;
+  try {
+    if (payroll) {
+      await c.query('BEGIN');
+      await c.query('SELECT pg_advisory_xact_lock(726025)');
+      try { await assertPayrollUnique(req.scope[0], req.scope[1], data, update ? req.params.id : null, c); }
+      catch (e) { if (e.code) throw e; await c.query('ROLLBACK'); return res.status(409).json({ error: e.message }); }
+    }
+    const q = update
+      ? await c.query('UPDATE records SET data=$5,version=version+1 WHERE store=$1 AND day=$2 AND tab=$3 AND id=$4 AND version=$6', [...req.scope, req.params.id, data, req.body.version])
+      : await c.query('INSERT INTO records(store,day,tab,data) VALUES($1,$2,$3,$4)', [...req.scope, data]);
+    if (payroll) await c.query('COMMIT');
+    if (!q.rowCount) return res.status(409).json({ error: '다른 직원이 변경했습니다. 새로고침하세요' });
+    res.json({ ok: true });
+  } catch (e) {
+    if (payroll) await c.query('ROLLBACK');
+    throw e;
+  } finally { if (payroll) c.release(); }
+}
+app.post('/api/records', scope, (req, res) => writeRecord(req, res, false));
+app.put('/api/records/:id', scope, (req, res) => writeRecord(req, res, true));
 
 app.delete('/api/records/:id', scope, async (req, res) => {
   const q = await pool.query('DELETE FROM records WHERE store=$1 AND day=$2 AND tab=$3 AND id=$4 AND version=$5', [...req.scope, req.params.id, req.body.version]);
@@ -220,6 +226,20 @@ app.delete('/api/records/:id', scope, async (req, res) => {
 app.get('/api/backup', adminOnly, async (req, res) => {
   const q = await pool.query('SELECT store,day::text,tab,data FROM records ORDER BY id');
   res.json(q.rows);
+});
+
+// Full snapshot; retain the original backup endpoint for compatibility.
+app.get('/api/backup-full', adminOnly, async (req, res) => {
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const records = (await c.query('SELECT id,store,day::text,tab,data,version FROM records ORDER BY id')).rows;
+    const scheduleRules = (await c.query('SELECT name,data FROM schedule_rules ORDER BY name')).rows;
+    const payrollSettings = (await c.query('SELECT year,min_wage FROM payroll_settings ORDER BY year')).rows;
+    await c.query('COMMIT');
+    res.json({ format: 'seoulbadang-full-v1', exportedAt: new Date().toISOString(), records, scheduleRules, payrollSettings });
+  } catch (e) { await c.query('ROLLBACK'); throw e; }
+  finally { c.release(); }
 });
 
 // 연도별 법정 최저임금 관리자 설정
